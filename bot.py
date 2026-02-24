@@ -23,6 +23,15 @@ TIERS = [
     (50_000,     TOPIC_50K,  '🚀 50K+ Followers'),
 ]
 
+FOLLOWER_MAP = {
+    '10M+': 10_000_000,
+    '1M+':   1_000_000,
+    '100k+':   100_000,
+    '10k+':     10_000,
+    '1k+':       1_000,
+    '0-1k':          0,
+}
+
 seen_coins = set()
 
 HEADERS = {
@@ -34,120 +43,125 @@ HEADERS = {
 
 API_URL = 'https://api.dubdub.tv/v1/feeds'
 
+def parse_followers(formatted):
+    if not formatted:
+        return 0
+    return FOLLOWER_MAP.get(formatted, 0)
+
 def fetch_coins():
     coins = []
     try:
         params = {'limit': 50, 'sortBy': 'added', 'chainType': 'solana'}
         r = requests.get(API_URL, headers=HEADERS, params=params, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            items = data if isinstance(data, list) else data.get('data') or data.get('items') or data.get('feeds') or data.get('tokens') or []
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                followers = 0
-                creator = item.get('creator') or {}
-                for field in ['creator_followers', 'dev_followers', 'twitter_followers', 'followers']:
-                    val = item.get(field) or creator.get(field) or creator.get('twitter_followers') or 0
-                    if val and isinstance(val, (int, float)) and val > 0:
-                        followers = int(val)
-                        break
-                notable = []
-                nf = item.get('notable_followers') or item.get('notableFollowers') or creator.get('notable_followers') or []
-                if isinstance(nf, list):
-                    for n in nf[:5]:
-                        if isinstance(n, dict):
-                            name = n.get('name') or n.get('username') or n.get('handle') or ''
-                            if name: notable.append(name)
-                        elif isinstance(n, str):
-                            notable.append(n)
-                contract = item.get('contract') or item.get('contract_address') or item.get('contractAddress') or item.get('mint') or item.get('address') or ''
-                ticker = item.get('ticker') or item.get('symbol') or ''
-                slug = item.get('slug') or str(item.get('id') or '')
-                name = item.get('name') or ticker or 'Unknown'
-                dev_name = item.get('creator_name') or item.get('dev_name') or creator.get('name') or creator.get('username') or creator.get('twitter_username') or 'Unknown'
-                coins.append({
-                    'id': str(item.get('id') or contract or slug or name),
-                    'name': name,
-                    'ticker': ticker,
-                    'followers': followers,
-                    'dev_name': dev_name,
-                    'logo': item.get('image') or item.get('logo') or item.get('icon') or item.get('image_url') or '',
-                    'notable_followers': notable,
-                    'market_cap': str(item.get('market_cap') or item.get('marketCap') or ''),
-                    'contract': contract,
-                    'url': f"https://anoncoin.it/coin/{slug}" if slug else 'https://anoncoin.it/board',
-                })
-        else:
-            log.error(f"API returned {r.status_code}")
+        log.info(f"API status: {r.status_code}")
+        if r.status_code != 200:
+            log.error(f"Bad status: {r.status_code} - {r.text[:200]}")
+            return []
+        data = r.json()
+        items = data.get('data', {}).get('docs', []) if isinstance(data, dict) else []
+        log.info(f"Raw items from API: {len(items)}")
+        for item in items:
+            user = item.get('userId') or {}
+            twitter = user.get('twitter') or {}
+            followers_fmt = twitter.get('followersFormatted', '0-1k')
+            followers = parse_followers(followers_fmt)
+            meta = item.get('metaData') or {}
+            notable = []
+            for nf in (meta.get('tagUserProfiles') or [])[:5]:
+                name = nf.get('name') or nf.get('userName') or ''
+                if name:
+                    notable.append(name)
+            token = item.get('token') or {}
+            contract = token.get('address') or ''
+            ticker = item.get('tickerSymbol') or token.get('symbol') or ''
+            name = item.get('title') or item.get('tickerName') or ticker or 'Unknown'
+            slug = ticker.lower() if ticker else str(item.get('_id', ''))
+            media = item.get('media') or []
+            logo = media[0].get('thumbnailUrl', '') if media else ''
+            dev_name = user.get('name') or user.get('userName') or 'Unknown'
+            dex_url = (token.get('aggregators') or {}).get('dexscreener') or f"https://dexscreener.com/search?q={contract or ticker}"
+            coins.append({
+                'id': str(item.get('_id') or contract or name),
+                'name': name,
+                'ticker': ticker,
+                'followers': followers,
+                'followers_fmt': followers_fmt,
+                'dev_name': dev_name,
+                'logo': logo,
+                'notable_followers': notable,
+                'market_cap': token.get('marketCap') or '',
+                'contract': contract,
+                'url': f"https://anoncoin.it/coin/{slug}",
+                'dex_url': dex_url,
+            })
     except Exception as e:
         log.error(f"Fetch error: {e}")
     return coins
 
 def send_message(thread_id, text, photo_url=None):
     base = f"https://api.telegram.org/bot{BOT_TOKEN}"
-    payload = {'chat_id': GROUP_ID, 'message_thread_id': int(thread_id), 'parse_mode': 'HTML', 'disable_web_page_preview': True}
+    payload = {
+        'chat_id': GROUP_ID,
+        'message_thread_id': int(thread_id),
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': True,
+    }
     try:
         if photo_url and photo_url.startswith('http'):
             payload['photo'] = photo_url
             payload['caption'] = text
             r = requests.post(f"{base}/sendPhoto", json=payload, timeout=10)
             if not r.json().get('ok'):
-                payload.pop('photo'); payload.pop('caption')
+                payload.pop('photo')
+                payload.pop('caption')
                 payload['text'] = text
                 requests.post(f"{base}/sendMessage", json=payload, timeout=10)
         else:
             payload['text'] = text
-            requests.post(f"{base}/sendMessage", json=payload, timeout=10)
+            r = requests.post(f"{base}/sendMessage", json=payload, timeout=10)
+            if not r.json().get('ok'):
+                log.error(f"Telegram error: {r.json()}")
     except Exception as e:
         log.error(f"Send failed: {e}")
 
-def format_followers(n):
-    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
-    if n >= 1_000: return f"{n/1_000:.0f}K"
-    return str(n)
-
-def dexscreener_url(contract, ticker):
-    if contract and len(contract) > 10: return f"https://dexscreener.com/search?q={contract}"
-    if ticker: return f"https://dexscreener.com/search?q={ticker}"
-    return "https://dexscreener.com"
-
 def format_message(coin, tier_label=None):
-    name = coin.get('name', 'Unknown')
-    ticker = coin.get('ticker', '')
-    followers = coin.get('followers', 0)
-    dev_name = coin.get('dev_name', 'Unknown')
-    notable = coin.get('notable_followers', [])
-    url = coin.get('url', 'https://anoncoin.it/board')
-    mkt_cap = coin.get('market_cap', '')
-    contract = coin.get('contract', '')
-    header = f"{tier_label}\n" if tier_label else "🌐 <b>New Launch</b>\n"
-    ticker_line = f" <code>${ticker}</code>" if ticker else ""
-    notable_line = f"\n👀 <b>Followed by:</b> {', '.join(notable[:5])}" if notable else ""
-    mc_line = f"\n💰 <b>Market Cap:</b> {mkt_cap}" if mkt_cap else ""
-    ca_line = f"\n📋 <b>Contract:</b>\n<code>{contract}</code>" if contract else ""
-    dex_url = dexscreener_url(contract, ticker)
+    name         = coin['name']
+    ticker       = coin['ticker']
+    followers_fmt = coin['followers_fmt']
+    dev_name     = coin['dev_name']
+    notable      = coin['notable_followers']
+    url          = coin['url']
+    mkt_cap      = coin['market_cap']
+    contract     = coin['contract']
+    dex_url      = coin['dex_url']
+    header       = f"{tier_label}\n" if tier_label else "🌐 <b>New Launch</b>\n"
+    ticker_line  = f" <code>${ticker}</code>" if ticker else ""
+    notable_line = f"\n👀 <b>Followed by:</b> {', '.join(notable)}" if notable else ""
+    mc_line      = f"\n💰 <b>Market Cap:</b> {mkt_cap}" if mkt_cap else ""
+    ca_line      = f"\n📋 <b>Contract:</b>\n<code>{contract}</code>" if contract else ""
     return (
-        f"{header}━━━━━━━━━━━━━━━\n"
+        f"{header}"
+        f"━━━━━━━━━━━━━━━\n"
         f"🪙 <b>{name}</b>{ticker_line}\n"
         f"👤 <b>Dev:</b> {dev_name}\n"
-        f"👥 <b>Followers:</b> {format_followers(followers) if followers else 'Unknown'}"
-        f"{notable_line}{mc_line}{ca_line}\n"
+        f"👥 <b>Followers:</b> {followers_fmt}"
+        f"{notable_line}"
+        f"{mc_line}"
+        f"{ca_line}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🔗 <a href='{url}'>Anoncoin</a>  |  📊 <a href='{dex_url}'>Dexscreener</a>"
     )
 
 def process_coins(coins):
-    global seen_coins
     new_count = 0
     for coin in coins:
-        cid = coin.get('id') or coin.get('name', '')
+        cid = coin['id']
         if not cid or cid in seen_coins:
             continue
         seen_coins.add(cid)
         new_count += 1
-        followers = coin.get('followers', 0)
-        logo = coin.get('logo', '')
+        followers = coin['followers']
+        logo = coin['logo']
         send_message(TOPIC_ALL, format_message(coin), logo or None)
         time.sleep(0.5)
         for threshold, topic_id, label in TIERS:
