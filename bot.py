@@ -100,45 +100,36 @@ def fetch_coins():
 
 def send_message(thread_id, text, photo_url=None):
     base = f"https://api.telegram.org/bot{BOT_TOKEN}"
-    payload = {
-        'chat_id': GROUP_ID,
-        'message_thread_id': int(thread_id),
-        'parse_mode': 'HTML',
-        'disable_web_page_preview': True,
-    }
+    common = {'chat_id': GROUP_ID, 'message_thread_id': int(thread_id)}
     try:
         if photo_url and photo_url.startswith('http'):
-            payload['photo'] = photo_url
-            payload['caption'] = text
-            r = requests.post(f"{base}/sendPhoto", json=payload, timeout=10)
-            if not r.json().get('ok'):
-                payload.pop('photo')
-                payload.pop('caption')
-                payload['text'] = text
-                requests.post(f"{base}/sendMessage", json=payload, timeout=10)
-        else:
-            payload['text'] = text
-            r = requests.post(f"{base}/sendMessage", json=payload, timeout=10)
-            if not r.json().get('ok'):
-                log.error(f"Telegram error: {r.json()}")
+            requests.post(f"{base}/sendPhoto", json={**common, 'photo': photo_url}, timeout=10)
+        r = requests.post(f"{base}/sendMessage", json={
+            **common,
+            'text': text,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': True,
+        }, timeout=10)
+        if not r.json().get('ok'):
+            log.error(f"Telegram error: {r.json()}")
     except Exception as e:
         log.error(f"Send failed: {e}")
 
 def format_message(coin, tier_label=None):
-    name         = coin['name']
-    ticker       = coin['ticker']
+    name          = coin['name']
+    ticker        = coin['ticker']
     followers_fmt = coin['followers_fmt']
-    dev_name     = coin['dev_name']
-    notable      = coin['notable_followers']
-    url          = coin['url']
-    mkt_cap      = coin['market_cap']
-    contract     = coin['contract']
-    dex_url      = coin['dex_url']
-    header       = f"{tier_label}\n" if tier_label else "🌐 <b>New Launch</b>\n"
-    ticker_line  = f" <code>${ticker}</code>" if ticker else ""
-    notable_line = f"\n👀 <b>Followed by:</b> {', '.join(notable)}" if notable else ""
-    mc_line      = f"\n💰 <b>Market Cap:</b> {mkt_cap}" if mkt_cap else ""
-    ca_line      = f"\n📋 <b>Contract:</b>\n<code>{contract}</code>" if contract else ""
+    dev_name      = coin['dev_name']
+    notable       = coin['notable_followers']
+    url           = coin['url']
+    mkt_cap       = coin['market_cap']
+    contract      = coin['contract']
+    dex_url       = coin['dex_url']
+    header        = f"{tier_label}\n" if tier_label else "🌐 <b>New Launch</b>\n"
+    ticker_line   = f" <code>${ticker}</code>" if ticker else ""
+    notable_line  = f"\n👀 <b>Followed by:</b> {', '.join(notable)}" if notable else "\n👀 <b>Followed by:</b> Not followed by anyone"
+    mc_line       = f"\n💰 <b>Market Cap:</b> {mkt_cap}" if mkt_cap else ""
+    ca_line       = f"\n📋 <b>Contract:</b>\n<code>{contract}</code>" if contract else ""
     return (
         f"{header}"
         f"━━━━━━━━━━━━━━━\n"
