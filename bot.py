@@ -192,7 +192,12 @@ def check_safety(report):
     risks = {r.get("name", "").lower() for r in report.get("risks", [])}
     freeze_ok = "freeze authority enabled" not in risks
     mint_ok   = "mint authority enabled" not in risks
-    lp_ok     = ("lp not burned" not in risks) or ("lp not locked" not in risks)
+    # LP is safe only if it is confirmed burned OR confirmed locked
+    # RugCheck adds "lp not burned" and "lp not locked" as risks when unsafe
+    # So LP is safe when BOTH of those risk names are absent (meaning it IS burned or locked)
+    lp_burned = "lp not burned" not in risks
+    lp_locked = "lp not locked" not in risks
+    lp_ok = lp_burned or lp_locked
     return (freeze_ok and mint_ok and lp_ok), {
         "freeze_disabled": freeze_ok,
         "mint_disabled":   mint_ok,
@@ -436,22 +441,32 @@ async def process_mint(bot, session, mint):
     if not pair:
         return
 
-    # Filter 1: minimum liquidity (1 SOL)
+    # Filter 1: minimum liquidity (1 SOL minimum, hard floor)
     liq_usd = float((pair.get("liquidity") or {}).get("usd", 0) or 0)
-    min_liq_usd = MIN_LIQUIDITY_SOL * SOL_PRICE_USD
+    # Use live SOL price, but never let min drop below $10 as a safety floor
+    min_liq_usd = max(MIN_LIQUIDITY_SOL * SOL_PRICE_USD, 10.0)
     if liq_usd < min_liq_usd:
         if DEBUG_MODE:
-            log.info(f"SKIP {mint[:8]}: liquidity too low ({liq_usd:.2f} USD < {min_liq_usd:.2f} USD)")
+            log.info(f"SKIP {mint[:8]}: liq too low (${liq_usd:.2f} < ${min_liq_usd:.2f})")
         return
 
-    # Filter 2: token must be under 48 hours old
+    # Filter 2: token must be under 48 hours old - HARD REJECT if no age data
     created_at = pair.get("pairCreatedAt")
-    if created_at:
-        age_secs = time.time() - created_at / 1000
-        if age_secs > MAX_TOKEN_AGE_SECS:
-            if DEBUG_MODE:
-                log.info(f"SKIP {mint[:8]}: too old ({age_secs/3600:.1f}h)")
-            return
+    if not created_at:
+        # No creation time available - skip to be safe
+        if DEBUG_MODE:
+            log.info(f"SKIP {mint[:8]}: no creation time")
+        return
+    age_secs = time.time() - created_at / 1000
+    if age_secs > MAX_TOKEN_AGE_SECS:
+        if DEBUG_MODE:
+            log.info(f"SKIP {mint[:8]}: too old ({age_secs/3600:.1f}h)")
+        return
+    if age_secs < 0:
+        # Timestamp looks wrong
+        if DEBUG_MODE:
+            log.info(f"SKIP {mint[:8]}: invalid timestamp")
+        return
 
     # Safety check via RugCheck
     report = await get_rugcheck(session, mint)
