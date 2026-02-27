@@ -441,6 +441,16 @@ async def process_mint(bot, session, mint):
     if not pair:
         return
 
+    # Filter 0: skip Pump.fun → Meteora graduations
+    all_pairs_check = await get_all_pairs_for_mint(session, mint)
+    dex_ids_check = {p.get("dexId", "").lower() for p in all_pairs_check}
+    is_pump = any("pump" in d for d in dex_ids_check)
+    is_meteora = any("meteora" in d for d in dex_ids_check)
+    if is_pump and is_meteora:
+        if DEBUG_MODE:
+            log.info(f"SKIP {mint[:8]}: Pump.fun -> Meteora graduation")
+        return
+
     # Filter 1: minimum liquidity (1 SOL minimum, hard floor)
     liq_usd = float((pair.get("liquidity") or {}).get("usd", 0) or 0)
     # Use live SOL price, but never let min drop below $10 as a safety floor
@@ -450,22 +460,20 @@ async def process_mint(bot, session, mint):
             log.info(f"SKIP {mint[:8]}: liq too low (${liq_usd:.2f} < ${min_liq_usd:.2f})")
         return
 
-    # Filter 2: token must be under 48 hours old - HARD REJECT if no age data
+    # Filter 2: token pair must have been created within 48 hours
     created_at = pair.get("pairCreatedAt")
-    if not created_at:
-        # No creation time available - skip to be safe
+    try:
+        # pairCreatedAt is in milliseconds
+        created_ts = float(created_at) / 1000.0
+        age_secs = time.time() - created_ts
+        if age_secs < 0 or age_secs > MAX_TOKEN_AGE_SECS:
+            if DEBUG_MODE:
+                log.info(f"SKIP {mint[:8]}: age={age_secs/3600:.1f}h (max {MAX_TOKEN_AGE_SECS/3600:.0f}h)")
+            return
+    except (TypeError, ValueError, ZeroDivisionError):
+        # No valid creation time — skip
         if DEBUG_MODE:
-            log.info(f"SKIP {mint[:8]}: no creation time")
-        return
-    age_secs = time.time() - created_at / 1000
-    if age_secs > MAX_TOKEN_AGE_SECS:
-        if DEBUG_MODE:
-            log.info(f"SKIP {mint[:8]}: too old ({age_secs/3600:.1f}h)")
-        return
-    if age_secs < 0:
-        # Timestamp looks wrong
-        if DEBUG_MODE:
-            log.info(f"SKIP {mint[:8]}: invalid timestamp")
+            log.info(f"SKIP {mint[:8]}: no valid pairCreatedAt")
         return
 
     # Safety check via RugCheck
@@ -564,7 +572,8 @@ async def main():
                     "  Freeze authority disabled\n"
                     "  Mint authority disabled\n"
                     "  LP burned or locked\n\n"
-                    "No age limit - works like Photon discover"
+                    "Max token age: 48 hours\n"
+                    "Min liquidity: 1 SOL"
                 ),
             )
         except TelegramError as e:
