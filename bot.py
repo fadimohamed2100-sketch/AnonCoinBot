@@ -13,10 +13,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID_HERE")
 DEBUG_MODE         = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
-POLL_INTERVAL   = 20   # seconds between full scans
-UPDATE_INTERVAL = 30   # seconds between live stat updates
+POLL_INTERVAL        = 20     # seconds between full scans
+UPDATE_INTERVAL      = 30     # seconds between live stat updates
 UPDATE_DURATION      = 3600   # stop updating after 1 hour
-MIN_LIQUIDITY_SOL    = 1.0     # minimum current liquidity in SOL
+MIN_LIQUIDITY_SOL    = 1.0    # minimum current liquidity in SOL
 MAX_TOKEN_AGE_SECS   = 48 * 3600  # 48 hours
 
 # Tokens we have already alerted on - never alert twice
@@ -52,6 +52,9 @@ BONDING_CURVE_DOMAINS = {
     "boop.fun":    "Boop",
 }
 
+# Anoncoin feeds API endpoint
+ANONCOIN_FEEDS_URL = "https://api.anoncoin.it/feeds"
+
 SOL_PRICE_USD = 140.0
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
@@ -66,7 +69,7 @@ SEP = "-" * 30
 
 def fmt_usd(n):
     try:
-        n = float(n)
+        n = float(str(n).replace("$", "").replace(",", ""))
         if n >= 1_000_000:
             return f"${n/1_000_000:.2f}M"
         if n >= 1_000:
@@ -77,7 +80,7 @@ def fmt_usd(n):
 
 def fmt_sol(usd_value):
     try:
-        return f"SOL {float(usd_value)/SOL_PRICE_USD:.2f}"
+        return f"SOL {float(str(usd_value).replace('$','').replace(',',''))/SOL_PRICE_USD:.2f}"
     except Exception:
         return "N/A"
 
@@ -109,14 +112,21 @@ def format_timestamp(ts):
 def bool_icon(v):
     return "YES" if v else "NO"
 
+def parse_usd_str(s):
+    """Parse strings like '$61,913' or '61913.5' into float."""
+    try:
+        return float(str(s).replace("$", "").replace(",", ""))
+    except Exception:
+        return 0.0
+
 
 # ═══════════════════════════════════════════════════════════════════
 # API
 # ═══════════════════════════════════════════════════════════════════
 
-async def fetch_json(session, url):
+async def fetch_json(session, url, params=None):
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=12)) as r:
             if r.status == 200:
                 return await r.json()
     except Exception as e:
@@ -129,6 +139,32 @@ async def update_sol_price(session):
     if data and data.get("solana", {}).get("usd"):
         SOL_PRICE_USD = float(data["solana"]["usd"])
         log.info(f"SOL price: ${SOL_PRICE_USD:.2f}")
+
+async def get_anoncoin_feeds(session):
+    """
+    Fetch the trending/latest feed from Anoncoin's API.
+    Returns list of feed docs.
+    """
+    # Try the feeds endpoint - based on the API response structure observed
+    endpoints_to_try = [
+        "https://api.anoncoin.it/feeds",
+        "https://api.anoncoin.it/v1/feeds",
+        "https://anoncoin.it/api/feeds",
+        "https://anoncoin.it/api/v1/feeds",
+    ]
+    for url in endpoints_to_try:
+        data = await fetch_json(session, url)
+        if data and isinstance(data, dict) and data.get("status") is True:
+            docs = data.get("data", {}).get("docs", [])
+            if docs:
+                log.info(f"Anoncoin feed fetched from {url}: {len(docs)} docs")
+                return docs
+        # Also try array response
+        if data and isinstance(data, list):
+            log.info(f"Anoncoin feed fetched from {url}: {len(data)} docs")
+            return data
+    log.warning("Could not fetch Anoncoin feeds from any endpoint")
+    return []
 
 async def get_all_pairs_for_mint(session, mint):
     data = await fetch_json(session, f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
@@ -185,16 +221,13 @@ async def get_lp_event_time(session, mint):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# SAFETY — this is the core gate
+# SAFETY — core gate
 # ═══════════════════════════════════════════════════════════════════
 
 def check_safety(report):
     risks = {r.get("name", "").lower() for r in report.get("risks", [])}
     freeze_ok = "freeze authority enabled" not in risks
     mint_ok   = "mint authority enabled" not in risks
-    # LP is safe only if it is confirmed burned OR confirmed locked
-    # RugCheck adds "lp not burned" and "lp not locked" as risks when unsafe
-    # So LP is safe when BOTH of those risk names are absent (meaning it IS burned or locked)
     lp_burned = "lp not burned" not in risks
     lp_locked = "lp not locked" not in risks
     lp_ok = lp_burned or lp_locked
@@ -238,7 +271,8 @@ async def detect_launch_type(session, mint, pair_info):
 # ═══════════════════════════════════════════════════════════════════
 
 def build_caption(pair, safety, initial_liquidity, launch_time,
-                  launch_type="direct", launch_platform="", lp_event_time=None):
+                  launch_type="direct", launch_platform="", lp_event_time=None,
+                  anoncoin_data=None):
     base      = pair.get("baseToken", {})
     name      = base.get("name", "Unknown")
     symbol    = base.get("symbol", "???")
@@ -254,8 +288,34 @@ def build_caption(pair, safety, initial_liquidity, launch_time,
     buys_1h   = (pair.get("txns") or {}).get("h1", {}).get("buys", 0)
     sells_1h  = (pair.get("txns") or {}).get("h1", {}).get("sells", 0)
 
+    # Supplement with Anoncoin data if DexScreener is missing values
+    if anoncoin_data:
+        token = anoncoin_data.get("token", {})
+        if not mc:
+            mc_str = token.get("marketCap", "")
+            mc = parse_usd_str(mc_str) if mc_str else None
+        if not price_usd or price_usd == "N/A":
+            price_raw = token.get("price", {})
+            if isinstance(price_raw, dict):
+                price_usd = str(price_raw.get("$numberDecimal", "N/A"))
+            else:
+                price_usd = str(price_raw) if price_raw else "N/A"
+        if not liq_usd:
+            tvl_str = token.get("tvl", "")
+            liq_usd = parse_usd_str(tvl_str) if tvl_str else 0.0
+        if not vol_5m:
+            vol_5m = token.get("volume5Mins")
+        if not vol_1h:
+            vol_1h = token.get("volume1Hrs")
+        # Graduation info
+        grad_pct = token.get("graduationPercentage", 0)
+        holders  = token.get("holders", "N/A")
+    else:
+        grad_pct = None
+        holders  = "N/A"
+
     badge = (
-        f"Graduated | {launch_platform or 'Unknown'} -> {dex_name}"
+        f"Graduated | {launch_platform or 'AnonCoin.it'} -> {dex_name}"
         if launch_type == "graduated"
         else f"Direct Launch | {dex_name}"
     )
@@ -268,13 +328,17 @@ def build_caption(pair, safety, initial_liquidity, launch_time,
 
     lp_str = format_timestamp(lp_event_time) if lp_event_time else "N/A"
 
-    return "\n".join([
+    grad_line = f"  Graduation: {grad_pct}%\n" if grad_pct is not None else ""
+    holders_line = f"  Holders: {holders}\n" if holders != "N/A" else ""
+
+    return "\n".join(filter(None, [
         f"*{name}* (${symbol})",
         f"_{badge}_",
         SEP,
         f"Token launched: {format_timestamp(launch_time)}",
         f"Price: ${price_usd}",
         f"Mkt Cap: {fmt_usd(mc)}",
+        (f"Graduation: {grad_pct}% | Holders: {holders}" if grad_pct is not None else None),
         SEP,
         "*Liquidity*",
         f"  Launch:   {fmt_liq(initial_liquidity)}",
@@ -295,9 +359,9 @@ def build_caption(pair, safety, initial_liquidity, launch_time,
         f"`{mint}`",
         "",
         "_Updates every 30s for 1h_",
-    ])
+    ]))
 
-def build_buttons(pair):
+def build_buttons(pair, anoncoin_data=None):
     base      = pair.get("baseToken", {})
     mint      = base.get("address", "")
     pair_addr = pair.get("pairAddress", "")
@@ -305,16 +369,35 @@ def build_buttons(pair):
     socials   = {s.get("type", "").lower(): s.get("url", "") for s in (info.get("socials") or [])}
     websites  = info.get("websites") or []
     website   = websites[0].get("url", "") if websites else ""
+
+    # Pull social links from Anoncoin metadata if not in DexScreener
+    if anoncoin_data:
+        meta = anoncoin_data.get("metaData", {}) or {}
+        if not socials.get("twitter") and meta.get("twitterLink"):
+            socials["twitter"] = meta["twitterLink"]
+        if not socials.get("telegram") and meta.get("telegramLink"):
+            socials["telegram"] = meta["telegramLink"]
+        if not website and meta.get("websiteLink"):
+            website = meta["websiteLink"]
+
+    # Use pair address for Photon/DexScreener; fall back to mint
+    photon_target = pair_addr or mint
+    ds_target     = pair_addr or mint
+
     rows = [
         [
-            InlineKeyboardButton("Photon",      url=f"https://photon-sol.tinyastro.io/en/lp/{pair_addr}"),
-            InlineKeyboardButton("DexScreener", url=f"https://dexscreener.com/solana/{pair_addr}"),
+            InlineKeyboardButton("Photon",      url=f"https://photon-sol.tinyastro.io/en/lp/{photon_target}"),
+            InlineKeyboardButton("DexScreener", url=f"https://dexscreener.com/solana/{ds_target}"),
         ],
         [
             InlineKeyboardButton("RugCheck",    url=f"https://rugcheck.xyz/tokens/{mint}"),
             InlineKeyboardButton("Birdeye",     url=f"https://birdeye.so/token/{mint}?chain=solana"),
         ],
     ]
+    # Anoncoin link
+    rows.append([
+        InlineKeyboardButton("AnonCoin.it", url=f"https://anoncoin.it/token/{mint}"),
+    ])
     row3 = []
     if website:
         row3.append(InlineKeyboardButton("Website",  url=website))
@@ -331,14 +414,48 @@ def build_buttons(pair):
 # SEND & UPDATE
 # ═══════════════════════════════════════════════════════════════════
 
-async def send_alert(bot, session, mint, pair, safety, launch_type, launch_platform, lp_event_time):
-    initial_liq = float((pair.get("liquidity") or {}).get("usd", 0) or 0)
-    created_at  = pair.get("pairCreatedAt")
-    launch_time = (created_at / 1000) if created_at else time.time()
+async def send_alert(bot, session, mint, pair, safety, launch_type, launch_platform,
+                     lp_event_time, anoncoin_data=None):
+    # Prefer DexScreener liquidity, fall back to Anoncoin TVL
+    liq_dex = float((pair.get("liquidity") or {}).get("usd", 0) or 0)
+    if not liq_dex and anoncoin_data:
+        token = anoncoin_data.get("token", {})
+        liq_dex = parse_usd_str(token.get("tvl", "0"))
 
-    caption = build_caption(pair, safety, initial_liq, launch_time, launch_type, launch_platform, lp_event_time)
-    buttons = build_buttons(pair)
-    logo    = await get_token_logo(session, mint)
+    initial_liq = liq_dex
+    created_at  = pair.get("pairCreatedAt")
+    if created_at:
+        launch_time = float(created_at) / 1000
+    elif anoncoin_data:
+        added_on = anoncoin_data.get("addedOn", "")
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(added_on.replace("Z", "+00:00"))
+            launch_time = dt.timestamp()
+        except Exception:
+            launch_time = time.time()
+    else:
+        launch_time = time.time()
+
+    caption = build_caption(pair, safety, initial_liq, launch_time,
+                            launch_type, launch_platform, lp_event_time, anoncoin_data)
+    buttons = build_buttons(pair, anoncoin_data)
+
+    # Try Anoncoin thumbnail first, then DexScreener
+    logo = None
+    if anoncoin_data:
+        media_list = anoncoin_data.get("media", [])
+        if media_list:
+            thumb_url = media_list[0].get("thumbnailUrl", "")
+            if thumb_url:
+                try:
+                    async with session.get(thumb_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                        if r.status == 200:
+                            logo = await r.read()
+                except Exception:
+                    pass
+    if not logo:
+        logo = await get_token_logo(session, mint)
 
     try:
         if logo:
@@ -358,9 +475,12 @@ async def send_alert(bot, session, mint, pair, safety, launch_type, launch_platf
             "safety": safety, "has_photo": logo is not None,
             "launch_type": launch_type, "launch_platform": launch_platform,
             "lp_event_time": lp_event_time, "alert_sent_at": time.time(),
+            "anoncoin_data": anoncoin_data,
         }
-        sym = pair.get("baseToken", {}).get("symbol", mint)
-        log.info(f"ALERT SENT: {sym} ({mint[:8]}) | {launch_type}")
+        sym = pair.get("baseToken", {}).get("symbol", mint) or (
+            anoncoin_data.get("token", {}).get("symbol", mint) if anoncoin_data else mint
+        )
+        log.info(f"ALERT SENT: {sym} ({mint[:8]}) | {launch_type} | {launch_platform}")
     except TelegramError as e:
         log.error(f"Send failed: {e}")
 
@@ -374,8 +494,9 @@ async def update_message(bot, session, mint):
     caption = build_caption(
         pair, info["safety"], info["initial_liquidity"], info["launch_time"],
         info["launch_type"], info["launch_platform"], info["lp_event_time"],
+        info.get("anoncoin_data"),
     )
-    buttons = build_buttons(pair)
+    buttons = build_buttons(pair, info.get("anoncoin_data"))
     try:
         if info["has_photo"]:
             await bot.edit_message_caption(
@@ -394,41 +515,52 @@ async def update_message(bot, session, mint):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# CORE SCAN — this is the main change
-# Scans the Photon discover endpoint directly for tokens that
-# CURRENTLY pass all filters, regardless of when they launched
+# CORE SCAN — Anoncoin feed + DexScreener
 # ═══════════════════════════════════════════════════════════════════
 
-async def scan_photon_discover(session):
+async def scan_sources(session):
     """
-    Fetch tokens from DexScreener boosted/latest that are on our
-    monitored DEXes. We check every token we haven't alerted on yet.
-    This mirrors what Photon discover does — shows tokens that meet
-    criteria NOW, not just when they launched.
-    """
-    results = []
+    Collect candidate mints from:
+    1. Anoncoin feeds API (primary - new source)
+    2. DexScreener token profiles (secondary)
+    3. DexScreener DEX search (secondary)
 
-    # Source 1: latest token profiles (new tokens)
+    Returns list of (mint, anoncoin_doc_or_None) tuples.
+    """
+    results = {}  # mint -> anoncoin_doc
+
+    # Source 1: Anoncoin feeds API
+    docs = await get_anoncoin_feeds(session)
+    for doc in docs:
+        token = doc.get("token", {})
+        mint = token.get("address", "")
+        if mint:
+            results[mint] = doc
+            log.debug(f"Anoncoin feed: {token.get('symbol', '?')} ({mint[:8]})")
+
+    # Source 2: DexScreener latest token profiles
     data = await fetch_json(session, "https://api.dexscreener.com/token-profiles/latest/v1")
     if data:
-        results += [t.get("tokenAddress") for t in data
-                    if isinstance(t, dict) and t.get("chainId") == "solana" and t.get("tokenAddress")]
+        for t in data:
+            if isinstance(t, dict) and t.get("chainId") == "solana":
+                mint = t.get("tokenAddress", "")
+                if mint and mint not in results:
+                    results[mint] = None
 
-    # Source 2: search each monitored DEX for recently active pairs
+    # Source 3: DexScreener DEX search
     for dex_id in MONITORED_DEXES:
         pairs_data = await fetch_json(session, f"https://api.dexscreener.com/latest/dex/search?q={dex_id}")
         if pairs_data and pairs_data.get("pairs"):
             for p in pairs_data["pairs"]:
                 if p.get("chainId") == "solana" and p.get("dexId") == dex_id:
                     mint = (p.get("baseToken") or {}).get("address")
-                    if mint:
-                        results.append(mint)
+                    if mint and mint not in results:
+                        results[mint] = None
 
-    # Deduplicate
-    return list(set(results))
+    return list(results.items())
 
 
-async def process_mint(bot, session, mint):
+async def process_mint(bot, session, mint, anoncoin_data=None):
     """
     Check a single mint. Alert if it passes all filters and we
     haven't alerted on it before.
@@ -438,7 +570,21 @@ async def process_mint(bot, session, mint):
 
     # Must be on a monitored DEX
     pair = await get_best_monitored_pair(session, mint)
-    if not pair:
+
+    # If not on a monitored DEX yet but we have Anoncoin data, check if graduated
+    if not pair and anoncoin_data:
+        token = anoncoin_data.get("token", {})
+        grad_pct = token.get("graduationPercentage", 0)
+        is_migrated = token.get("isMigrated", False)
+        if not is_migrated and grad_pct < 100:
+            if DEBUG_MODE:
+                log.info(f"SKIP {mint[:8]}: not yet on monitored DEX (grad={grad_pct}%)")
+            return
+        # Even if migrated, need a pair on a monitored DEX
+        if DEBUG_MODE:
+            log.info(f"SKIP {mint[:8]}: migrated but no pair on monitored DEX yet")
+        return
+    elif not pair:
         return
 
     # Filter 0: skip Pump.fun → Meteora graduations
@@ -451,9 +597,13 @@ async def process_mint(bot, session, mint):
             log.info(f"SKIP {mint[:8]}: Pump.fun -> Meteora graduation")
         return
 
-    # Filter 1: minimum liquidity (1 SOL minimum, hard floor)
+    # Filter 1: minimum liquidity (1 SOL minimum)
     liq_usd = float((pair.get("liquidity") or {}).get("usd", 0) or 0)
-    # Use live SOL price, but never let min drop below $10 as a safety floor
+    # Supplement with Anoncoin TVL if DexScreener liq is missing
+    if not liq_usd and anoncoin_data:
+        token = anoncoin_data.get("token", {})
+        liq_usd = parse_usd_str(token.get("tvl", "0"))
+
     min_liq_usd = max(MIN_LIQUIDITY_SOL * SOL_PRICE_USD, 10.0)
     if liq_usd < min_liq_usd:
         if DEBUG_MODE:
@@ -462,18 +612,32 @@ async def process_mint(bot, session, mint):
 
     # Filter 2: token pair must have been created within 48 hours
     created_at = pair.get("pairCreatedAt")
-    try:
-        # pairCreatedAt is in milliseconds
-        created_ts = float(created_at) / 1000.0
-        age_secs = time.time() - created_ts
+    launch_time_for_age = None
+    if created_at:
+        try:
+            launch_time_for_age = float(created_at) / 1000.0
+        except (TypeError, ValueError):
+            pass
+
+    # Fall back to Anoncoin addedOn date
+    if not launch_time_for_age and anoncoin_data:
+        added_on = anoncoin_data.get("addedOn", "")
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(added_on.replace("Z", "+00:00"))
+            launch_time_for_age = dt.timestamp()
+        except Exception:
+            pass
+
+    if launch_time_for_age:
+        age_secs = time.time() - launch_time_for_age
         if age_secs < 0 or age_secs > MAX_TOKEN_AGE_SECS:
             if DEBUG_MODE:
                 log.info(f"SKIP {mint[:8]}: age={age_secs/3600:.1f}h (max {MAX_TOKEN_AGE_SECS/3600:.0f}h)")
             return
-    except (TypeError, ValueError, ZeroDivisionError):
-        # No valid creation time — skip
+    else:
         if DEBUG_MODE:
-            log.info(f"SKIP {mint[:8]}: no valid pairCreatedAt")
+            log.info(f"SKIP {mint[:8]}: no valid creation time")
         return
 
     # Safety check via RugCheck
@@ -492,7 +656,8 @@ async def process_mint(bot, session, mint):
 
     # Passed! Mark as alerted so we never double-send
     alerted_mints.add(mint)
-    log.info(f"PASSES FILTERS: {mint[:8]} on {pair.get('dexId')}")
+    sym = pair.get("baseToken", {}).get("symbol", mint[:8])
+    log.info(f"PASSES FILTERS: {sym} ({mint[:8]}) on {pair.get('dexId')}")
 
     # Gather extra info in parallel
     results = await asyncio.gather(
@@ -505,10 +670,17 @@ async def process_mint(bot, session, mint):
         launch_type, launch_platform = "direct", ""
     else:
         launch_type, launch_platform = launch_result
+
+    # If Anoncoin data present, we know it came from Anoncoin's bonding curve
+    if anoncoin_data and launch_type == "direct":
+        launch_type = "graduated"
+        launch_platform = "AnonCoin.it"
+
     if isinstance(lp_event_time, Exception):
         lp_event_time = None
 
-    await send_alert(bot, session, mint, pair, safety, launch_type, launch_platform, lp_event_time)
+    await send_alert(bot, session, mint, pair, safety, launch_type, launch_platform,
+                     lp_event_time, anoncoin_data)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -555,7 +727,7 @@ async def debug_loop(bot, session):
 # ═══════════════════════════════════════════════════════════════════
 
 async def main():
-    log.info("Solana Launch Monitor starting...")
+    log.info("Solana Launch Monitor (Anoncoin edition) starting...")
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
     async with aiohttp.ClientSession() as session:
@@ -567,6 +739,7 @@ async def main():
                 parse_mode=ParseMode.MARKDOWN,
                 text=(
                     "*Solana Launch Monitor is live!*\n\n"
+                    "Sources: AnonCoin.it feed + DexScreener\n"
                     "Watching: Raydium V4, CPMM, Meteora DAMM, DYN\n\n"
                     "Alerts fire when a token CURRENTLY passes:\n"
                     "  Freeze authority disabled\n"
@@ -585,13 +758,14 @@ async def main():
 
         while True:
             try:
-                mints = await scan_photon_discover(session)
-                log.info(f"Scan found {len(mints)} unique mints to check")
+                mint_pairs = await scan_sources(session)
+                log.info(f"Scan found {len(mint_pairs)} unique mints to check")
                 # Process in small batches to avoid hammering APIs
-                for i in range(0, len(mints), 5):
-                    batch = mints[i:i+5]
+                for i in range(0, len(mint_pairs), 5):
+                    batch = mint_pairs[i:i+5]
                     await asyncio.gather(
-                        *[process_mint(bot, session, m) for m in batch],
+                        *[process_mint(bot, session, mint, anon_doc)
+                          for mint, anon_doc in batch],
                         return_exceptions=True,
                     )
                     await asyncio.sleep(1)
