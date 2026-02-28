@@ -10,29 +10,32 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID_HERE")
-DEBUG_MODE         = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
-POLL_INTERVAL   = 15     # seconds between feed scans
-UPDATE_INTERVAL = 30     # seconds between live stat updates
-UPDATE_DURATION = 3600   # stop updating after 1 hour
+# Supergroup chat ID (negative number)
+GROUP_ID   = int(os.getenv("GROUP_ID", "0"))
 
-# Tokens we have already alerted on
+# Topic (message_thread_id) per follower tier — falls back to TOPIC_ALL if not set
+TOPIC_ALL  = os.getenv("TOPIC_ALL")   # every alert goes here regardless
+TOPIC_50K  = os.getenv("TOPIC_50K")   # 50k+
+TOPIC_100K = os.getenv("TOPIC_100K")  # 100k+
+TOPIC_500K = os.getenv("TOPIC_500K")  # 500k+
+TOPIC_1M   = os.getenv("TOPIC_1M")    # 1M+
+TOPIC_10M  = os.getenv("TOPIC_10M")   # 10M+
+
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+
+POLL_INTERVAL   = 15
+UPDATE_INTERVAL = 30
+UPDATE_DURATION = 3600
+
 alerted_mints: set[str] = set()
-
-# Tokens currently being live-updated
 active_tokens: dict[str, dict] = {}
 
-# Anoncoin API endpoints to try in order
-ANONCOIN_ENDPOINTS = [
-    "https://anoncoin.it/api/feeds",
-    "https://anoncoin.it/api/v1/feeds",
-    "https://anoncoin.it/api/feed",
-    "https://anoncoin.it/api/trending",
-    "https://anoncoin.it/api/v1/trending",
-    "https://api2.anoncoin.it/feeds",
-    "https://backend.anoncoin.it/feeds",
-    "https://backend.anoncoin.it/v1/feeds",
+FEED_ENDPOINTS = [
+    "https://api.dubdub.tv/v1/feeds?limit=50&sortBy=addedOn&chainType=solana",
+    "https://api.dubdub.tv/v1/feeds?limit=50&sortBy=trending&chainType=solana",
+    "https://api.dubdub.tv/v1/feeds?limit=50&sortBy=addedOn",
+    "https://api.dubdub.tv/v1/feeds?limit=50&sortBy=trending",
 ]
 
 BROWSER_HEADERS = {
@@ -44,10 +47,10 @@ BROWSER_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://anoncoin.it",
-    "Referer": "https://anoncoin.it/",
+    "Referer": "https://anoncoin.it/board",
 }
 
-# Follower tier → emoji (matches anoncoin.it display)
+# Follower tier display strings (matches anoncoin.it exactly)
 FOLLOWER_TIERS = {
     "0-1k":   "⚪ 0-1k",
     "1k+":    "🟢 1k+",
@@ -69,6 +72,65 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=lo
 log = logging.getLogger(__name__)
 
 SEP = "――――――――――――――――――――――"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TOPIC ROUTING
+# ═══════════════════════════════════════════════════════════════════
+
+def get_topics_for_tier(followers_formatted: str) -> list[int | None]:
+    """
+    Returns a list of topic IDs to send the alert to.
+    TOPIC_ALL always receives every alert.
+    Higher tier topics receive alerts for their tier and above.
+
+    Tier hierarchy:
+      0-1k / 1k+ / 10k+ / 25k+  → TOPIC_ALL only
+      50k+  / 250k+              → TOPIC_ALL + TOPIC_50K
+      100k+                      → TOPIC_ALL + TOPIC_50K + TOPIC_100K
+      500k+                      → TOPIC_ALL + TOPIC_50K + TOPIC_100K + TOPIC_500K
+      1M+  / 5M+                 → TOPIC_ALL + TOPIC_50K + TOPIC_100K + TOPIC_500K + TOPIC_1M
+      10M+ / 15M+                → all topics
+    """
+    key = (followers_formatted or "").lower().strip()
+
+    # Build the list of topics to post to
+    topics = []
+
+    # Always add TOPIC_ALL
+    if TOPIC_ALL:
+        topics.append(int(TOPIC_ALL))
+
+    if key in ("50k+", "250k+", "100k+", "500k+", "1m+", "5m+", "10m+", "15m+"):
+        if TOPIC_50K:
+            topics.append(int(TOPIC_50K))
+
+    if key in ("100k+", "500k+", "1m+", "5m+", "10m+", "15m+"):
+        if TOPIC_100K:
+            topics.append(int(TOPIC_100K))
+
+    if key in ("500k+", "1m+", "5m+", "10m+", "15m+"):
+        if TOPIC_500K:
+            topics.append(int(TOPIC_500K))
+
+    if key in ("1m+", "5m+", "10m+", "15m+"):
+        if TOPIC_1M:
+            topics.append(int(TOPIC_1M))
+
+    if key in ("10m+", "15m+"):
+        if TOPIC_10M:
+            topics.append(int(TOPIC_10M))
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for t in topics:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+
+    # If no topics configured at all, fall back to no thread (plain group message)
+    return unique if unique else [None]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -94,7 +156,8 @@ def fmt_pct(s):
 
 def fmt_num(n):
     try:
-        return f"{int(float(n)):,}"
+        v = int(float(n))
+        return f"{v:,}" if v else "0"
     except Exception:
         return "0"
 
@@ -109,12 +172,6 @@ def fmt_impressions(n):
     except Exception:
         return "?"
 
-def parse_usd_str(s):
-    try:
-        return float(str(s).replace("$", "").replace(",", ""))
-    except Exception:
-        return 0.0
-
 def parse_iso(ts_str):
     try:
         dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
@@ -122,7 +179,7 @@ def parse_iso(ts_str):
     except Exception:
         return None
 
-def follower_tier(followers_formatted: str) -> str:
+def follower_tier_display(followers_formatted: str) -> str:
     if not followers_formatted:
         return "⚪ 0-1k"
     key = followers_formatted.lower().strip()
@@ -163,31 +220,42 @@ async def update_sol_price(session):
     )
     if data and data.get("solana", {}).get("usd"):
         SOL_PRICE_USD = float(data["solana"]["usd"])
-        log.info(f"SOL price updated: ${SOL_PRICE_USD:.2f}")
+        log.info(f"SOL price: ${SOL_PRICE_USD:.2f}")
 
-async def get_anoncoin_feeds(session):
-    """Fetch latest token feed from Anoncoin. Returns list of docs."""
-    for url in ANONCOIN_ENDPOINTS:
+async def get_feeds(session):
+    seen   = set()
+    result = []
+    for url in FEED_ENDPOINTS:
         data = await fetch_json(session, url, headers=BROWSER_HEADERS)
         if not data:
             continue
         if isinstance(data, dict) and data.get("status") is True:
             docs = data.get("data", {}).get("docs", [])
             if docs:
-                log.info(f"Anoncoin feed: {len(docs)} docs from {url}")
-                return docs
-        if isinstance(data, list) and len(data) > 0:
-            log.info(f"Anoncoin feed (array): {len(data)} docs from {url}")
-            return data
-    log.warning("Could not fetch Anoncoin feeds from any known endpoint")
-    return []
+                log.info(f"Feed OK ({len(docs)} docs): {url}")
+                for doc in docs:
+                    mint = (doc.get("token") or {}).get("address", "")
+                    if mint and mint not in seen:
+                        seen.add(mint)
+                        result.append(doc)
+                if "addedOn" in url:
+                    break
+            continue
+        if isinstance(data, list):
+            for doc in data:
+                mint = (doc.get("token") or {}).get("address", "")
+                if mint and mint not in seen:
+                    seen.add(mint)
+                    result.append(doc)
+            break
+    if not result:
+        log.warning("All feed endpoints failed")
+    return result
 
 async def get_dexscreener_token(session, mint):
-    """Fetch token data from DexScreener for live price/vol updates."""
     data = await fetch_json(session, f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
     if not data or not data.get("pairs"):
         return None
-    # Return the pair with highest liquidity on Solana
     sol_pairs = [p for p in data["pairs"] if p.get("chainId") == "solana"]
     if not sol_pairs:
         return None
@@ -199,54 +267,43 @@ async def get_dexscreener_token(session, mint):
 # ═══════════════════════════════════════════════════════════════════
 
 def build_message(doc, dex_pair=None):
-    """
-    Build the alert message from an Anoncoin feed doc.
-    Optionally supplement with live DexScreener data.
-    Format mirrors the screenshot layout.
-    """
-    token    = doc.get("token", {}) or {}
-    user     = doc.get("userId", {}) or {}
-    meta     = doc.get("metaData", {}) or {}
-    trend    = doc.get("twitterTrend", {}) or {}
+    token = doc.get("token", {}) or {}
+    user  = doc.get("userId", {}) or {}
+    meta  = doc.get("metaData", {}) or {}
+    trend = doc.get("twitterTrend", {}) or {}
 
-    # ── Token basics ──────────────────────────────────────────────
-    name    = token.get("name", "Unknown")
-    symbol  = token.get("symbol", "???")
-    mint    = token.get("address", "")
+    name   = token.get("name", "Unknown")
+    symbol = token.get("symbol", "???")
+    mint   = token.get("address", "")
 
-    # ── Market data: prefer DexScreener live, fallback Anoncoin ───
+    # Market data
     if dex_pair:
-        mc_raw   = dex_pair.get("marketCap") or dex_pair.get("fdv")
-        mc       = fmt_usd(mc_raw)
-        price    = dex_pair.get("priceUsd", "—")
-        vol_24h  = fmt_usd((dex_pair.get("volume") or {}).get("h24"))
-        vol_1h   = fmt_usd((dex_pair.get("volume") or {}).get("h1"))
-        vol_5m   = fmt_usd((dex_pair.get("volume") or {}).get("m5"))
-        chg_24h  = fmt_pct((dex_pair.get("priceChange") or {}).get("h24"))
-        holders  = fmt_num(token.get("holders", 0))
+        mc_raw  = dex_pair.get("marketCap") or dex_pair.get("fdv")
+        mc      = fmt_usd(mc_raw) if mc_raw else fmt_usd(token.get("marketCap"))
+        chg_24h = fmt_pct((dex_pair.get("priceChange") or {}).get("h24"))
+        vol_24h = fmt_usd((dex_pair.get("volume") or {}).get("h24"))
+        vol_1h  = fmt_usd((dex_pair.get("volume") or {}).get("h1"))
+        vol_5m  = fmt_usd((dex_pair.get("volume") or {}).get("m5"))
     else:
-        mc       = token.get("marketCap", "—")
-        price    = ""
-        chg_raw  = token.get("priceChange24Hrs", "")
-        chg_24h  = chg_raw if chg_raw else "—"
-        vol_24h  = token.get("volume24Hrs", "—")
-        vol_1h   = token.get("volume1Hrs", "—")
-        vol_5m   = token.get("volume5Mins", "—")
-        holders  = fmt_num(token.get("holders", 0))
+        mc      = token.get("marketCap", "—")
+        chg_24h = token.get("priceChange24Hrs", "—") or "—"
+        vol_24h = token.get("volume24Hrs", "$0") or "$0"
+        vol_1h  = token.get("volume1Hrs", "—") or "—"
+        vol_5m  = token.get("volume5Mins", "—") or "—"
 
+    holders  = fmt_num(token.get("holders", 0))
     grad_pct = token.get("graduationPercentage", 0)
-    tvl      = token.get("tvl", "—")
 
-    # ── Dev / creator ─────────────────────────────────────────────
-    dev_name    = user.get("name") or user.get("userName", "Unknown")
-    dev_handle  = user.get("userName", "")
-    twitter_obj = user.get("twitter", {}) or {}
-    followers   = follower_tier(twitter_obj.get("followersFormatted", ""))
+    # Dev info
+    dev_name      = user.get("name") or user.get("userName", "Unknown")
+    tw_obj        = user.get("twitter", {}) or {}
+    followers_fmt = tw_obj.get("followersFormatted", "")
+    followers     = follower_tier_display(followers_fmt)
 
-    # ── Followed by (tagged notable accounts) ────────────────────
+    # Followed by
     tagged = meta.get("tagUserProfiles") or []
     if tagged:
-        followed_parts = []
+        parts = []
         for t in tagged[:3]:
             t_name   = t.get("name") or t.get("userName", "")
             t_handle = t.get("userName", "")
@@ -261,24 +318,23 @@ def build_message(doc, dex_pair=None):
                         fc_str = f"{fc_int/1_000:.0f}K"
                     else:
                         fc_str = str(fc_int)
-                    followed_parts.append(f"[{t_name}]({t_url}) ({fc_str})")
+                    parts.append(f"[{t_name}]({t_url}) ({fc_str})")
                 except Exception:
-                    followed_parts.append(f"[{t_name}]({t_url})")
+                    parts.append(f"[{t_name}]({t_url})")
             else:
-                followed_parts.append(f"[{t_name}]({t_url})")
-        followed_by = ", ".join(followed_parts)
+                parts.append(f"[{t_name}]({t_url})")
+        followed_by = ", ".join(parts)
     else:
         followed_by = "Not followed by anyone"
 
-    # ── Twitter trend top voices ──────────────────────────────────
+    # Twitter trend
     x_views    = trend.get("xViews", 0)
     top_voices = trend.get("topVoices") or []
 
-    # ── Launch time ───────────────────────────────────────────────
+    # Launch time
     launched_ts  = parse_iso(doc.get("addedOn", ""))
     launched_str = elapsed_str(time.time() - launched_ts) if launched_ts else "—"
 
-    # ── Build lines ───────────────────────────────────────────────
     lines = [
         f"🌐 *New Launch*",
         SEP,
@@ -286,23 +342,22 @@ def build_message(doc, dex_pair=None):
         f"👤 *Dev:* {dev_name}",
         f"👥 *Followers:* {followers}",
         f"👀 *Followed by:* {followed_by}",
+        SEP,
     ]
 
-    # Top voices section
-    if top_voices or x_views:
-        lines.append(SEP)
+    if x_views or top_voices:
         if x_views:
             lines.append(f"🐦 *X Views:* {fmt_impressions(x_views)}")
         if top_voices:
             lines.append(f"📣 *Top Voices:*")
             for v in top_voices[:3]:
-                v_name  = v.get("name", "")
-                v_url   = v.get("tweetLink") or f"https://x.com/{v.get('username','')}"
-                imp     = fmt_impressions(v.get("impressionCount", 0))
+                v_name = v.get("name", "")
+                v_url  = v.get("tweetLink") or f"https://x.com/{v.get('username','')}"
+                imp    = fmt_impressions(v.get("impressionCount", 0))
                 lines.append(f"  • [{v_name}]({v_url}) — {imp} views")
+        lines.append(SEP)
 
     lines += [
-        SEP,
         f"💰 *Market Cap:* {mc}",
         f"👥 *Holders:* {holders}",
         f"📈 *24h Change:* {chg_24h}",
@@ -318,52 +373,40 @@ def build_message(doc, dex_pair=None):
     return "\n".join(lines)
 
 def build_buttons(doc):
-    token    = doc.get("token", {}) or {}
-    mint     = token.get("address", "")
-    meta     = doc.get("metaData", {}) or {}
-    agg      = token.get("aggregators", {}) or {}
-
-    anoncoin_url   = f"https://anoncoin.it/token/{mint}"
-    dexscreener_url = agg.get("dexscreener") or f"https://dexscreener.com/solana/{mint}"
-    photon_url      = agg.get("photon") or f"https://photon-sol.tinyastro.io/en/lp/{mint}"
-    axiom_url       = agg.get("axiom") or f"https://axiom.trade/t/{mint}?chain=sol"
+    token = doc.get("token", {}) or {}
+    mint  = token.get("address", "")
+    meta  = doc.get("metaData", {}) or {}
+    agg   = token.get("aggregators", {}) or {}
 
     rows = [
         [
-            InlineKeyboardButton("🌐 Anoncoin",    url=anoncoin_url),
-            InlineKeyboardButton("📊 DexScreener", url=dexscreener_url),
+            InlineKeyboardButton("🌐 Anoncoin",    url=f"https://anoncoin.it/token/{mint}"),
+            InlineKeyboardButton("📊 DexScreener", url=agg.get("dexscreener") or f"https://dexscreener.com/solana/{mint}"),
         ],
         [
-            InlineKeyboardButton("⚡ Photon",      url=photon_url),
-            InlineKeyboardButton("🔍 Axiom",       url=axiom_url),
+            InlineKeyboardButton("⚡ Photon",      url=agg.get("photon") or f"https://photon-sol.tinyastro.io/en/lp/{mint}"),
+            InlineKeyboardButton("🔍 Axiom",       url=agg.get("axiom") or f"https://axiom.trade/t/{mint}?chain=sol"),
         ],
     ]
-
     row3 = []
-    twitter_link  = meta.get("twitterLink", "")
-    telegram_link = meta.get("telegramLink", "")
-    website_link  = meta.get("websiteLink", "")
-    if twitter_link:
-        row3.append(InlineKeyboardButton("🐦 Twitter", url=twitter_link))
-    if telegram_link:
-        row3.append(InlineKeyboardButton("✈️ Telegram", url=telegram_link))
-    if website_link:
-        row3.append(InlineKeyboardButton("🌍 Website", url=website_link))
+    if meta.get("twitterLink"):
+        row3.append(InlineKeyboardButton("🐦 Twitter",  url=meta["twitterLink"]))
+    if meta.get("telegramLink"):
+        row3.append(InlineKeyboardButton("✈️ Telegram", url=meta["telegramLink"]))
+    if meta.get("websiteLink"):
+        row3.append(InlineKeyboardButton("🌍 Website",  url=meta["websiteLink"]))
     if row3:
         rows.append(row3)
-
     return InlineKeyboardMarkup(rows)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# SEND & UPDATE
+# LOGO
 # ═══════════════════════════════════════════════════════════════════
 
 async def get_token_logo(session, doc):
-    """Try Anoncoin thumbnail, then DexScreener."""
     token = doc.get("token", {}) or {}
     mint  = token.get("address", "")
-
     media_list = doc.get("media", [])
     if media_list:
         thumb_url = media_list[0].get("thumbnailUrl", "")
@@ -374,7 +417,6 @@ async def get_token_logo(session, doc):
                         return await r.read()
             except Exception:
                 pass
-
     for url in [
         f"https://dd.dexscreener.com/ds-data/tokens/solana/{mint}.png",
         f"https://img.dexscreener.com/token-images/solana/{mint}.png",
@@ -387,48 +429,64 @@ async def get_token_logo(session, doc):
             continue
     return None
 
-async def send_alert(bot, session, doc):
-    token = doc.get("token", {}) or {}
-    mint  = token.get("address", "")
 
-    # Try to get live DexScreener data too (may not exist yet for brand new tokens)
-    dex_pair = await get_dexscreener_token(session, mint)
+# ═══════════════════════════════════════════════════════════════════
+# SEND & UPDATE
+# ═══════════════════════════════════════════════════════════════════
 
-    text    = build_message(doc, dex_pair)
-    buttons = build_buttons(doc)
-    logo    = await get_token_logo(session, doc)
+async def send_to_topic(bot, topic_id, text, buttons, logo):
+    """Send a message to a specific topic thread."""
+    kwargs = dict(
+        chat_id=GROUP_ID,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=buttons,
+    )
+    if topic_id is not None:
+        kwargs["message_thread_id"] = topic_id
 
     try:
         if logo:
-            msg = await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=logo,
-                caption=text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=buttons,
-            )
+            msg = await bot.send_photo(photo=logo, caption=text, **kwargs)
         else:
-            msg = await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=buttons,
-                disable_web_page_preview=True,
-            )
+            msg = await bot.send_message(text=text, disable_web_page_preview=True, **kwargs)
+        return msg
+    except TelegramError as e:
+        log.error(f"Send to topic {topic_id} failed: {e}")
+        return None
 
+async def send_alert(bot, session, doc):
+    token         = doc.get("token", {}) or {}
+    mint          = token.get("address", "")
+    user          = doc.get("userId", {}) or {}
+    tw_obj        = user.get("twitter", {}) or {}
+    followers_fmt = tw_obj.get("followersFormatted", "")
+
+    dex_pair = await get_dexscreener_token(session, mint)
+    text     = build_message(doc, dex_pair)
+    buttons  = build_buttons(doc)
+    logo     = await get_token_logo(session, doc)
+
+    # Get all topics this follower tier should be posted to
+    topics = get_topics_for_tier(followers_fmt)
+
+    sent_messages = {}
+    for topic_id in topics:
+        msg = await send_to_topic(bot, topic_id, text, buttons, logo)
+        if msg:
+            sent_messages[topic_id] = {
+                "message_id": msg.message_id,
+                "has_photo":  logo is not None,
+            }
+        await asyncio.sleep(0.3)  # small gap between topic posts
+
+    if sent_messages:
         active_tokens[mint] = {
-            "message_id":    msg.message_id,
-            "chat_id":       TELEGRAM_CHAT_ID,
-            "has_photo":     logo is not None,
+            "messages":      sent_messages,   # topic_id -> {message_id, has_photo}
             "alert_sent_at": time.time(),
             "doc":           doc,
         }
-
         sym = token.get("symbol", mint[:8])
-        log.info(f"ALERT SENT: {sym} ({mint[:8]})")
-
-    except TelegramError as e:
-        log.error(f"Send failed for {mint[:8]}: {e}")
+        log.info(f"ALERT SENT: {sym} ({mint[:8]}) | tier={followers_fmt} | topics={list(sent_messages.keys())}")
 
 async def update_message(bot, session, mint):
     info = active_tokens.get(mint)
@@ -440,58 +498,55 @@ async def update_message(bot, session, mint):
     text     = build_message(doc, dex_pair)
     buttons  = build_buttons(doc)
 
-    try:
-        if info["has_photo"]:
-            await bot.edit_message_caption(
-                chat_id=info["chat_id"],
-                message_id=info["message_id"],
-                caption=text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=buttons,
-            )
-        else:
-            await bot.edit_message_text(
-                chat_id=info["chat_id"],
-                message_id=info["message_id"],
-                text=text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=buttons,
-                disable_web_page_preview=True,
-            )
-    except TelegramError as e:
-        if "message is not modified" not in str(e).lower():
-            log.warning(f"Edit failed {mint}: {e}")
+    for topic_id, msg_info in info["messages"].items():
+        try:
+            if msg_info["has_photo"]:
+                await bot.edit_message_caption(
+                    chat_id=GROUP_ID,
+                    message_id=msg_info["message_id"],
+                    caption=text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=buttons,
+                )
+            else:
+                await bot.edit_message_text(
+                    chat_id=GROUP_ID,
+                    message_id=msg_info["message_id"],
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=buttons,
+                    disable_web_page_preview=True,
+                )
+        except TelegramError as e:
+            if "message is not modified" not in str(e).lower():
+                log.warning(f"Edit failed topic={topic_id} mint={mint[:8]}: {e}")
+        await asyncio.sleep(0.2)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# MAIN SCAN LOOP
+# SCAN LOOP
 # ═══════════════════════════════════════════════════════════════════
 
 async def scan_and_alert(bot, session):
-    """Fetch Anoncoin feed and alert on any new token we haven't seen."""
-    docs = await get_anoncoin_feeds(session)
+    docs = await get_feeds(session)
     if not docs:
         return
-
     new_count = 0
     for doc in docs:
         token = doc.get("token", {}) or {}
         mint  = token.get("address", "")
         if not mint or mint in alerted_mints:
             continue
-
         alerted_mints.add(mint)
         new_count += 1
         sym = token.get("symbol", mint[:8])
         log.info(f"NEW TOKEN: {sym} ({mint[:8]})")
         await send_alert(bot, session, doc)
-        await asyncio.sleep(0.5)  # small delay between sends
-
+        await asyncio.sleep(0.5)
     if new_count:
         log.info(f"Sent {new_count} new alert(s)")
 
 async def live_update_loop(bot, session):
-    """Update active token messages every 30s for up to 1 hour."""
     sol_counter = 0
     while True:
         await asyncio.sleep(UPDATE_INTERVAL)
@@ -499,16 +554,11 @@ async def live_update_loop(bot, session):
         if sol_counter >= 20:
             await update_sol_price(session)
             sol_counter = 0
-
-        now = time.time()
-        expired = [
-            m for m, i in list(active_tokens.items())
-            if now - i["alert_sent_at"] > UPDATE_DURATION
-        ]
+        now     = time.time()
+        expired = [m for m, i in list(active_tokens.items()) if now - i["alert_sent_at"] > UPDATE_DURATION]
         for mint in expired:
-            log.info(f"Expiring live updates for {mint[:8]}")
+            log.info(f"Expiring updates for {mint[:8]}")
             del active_tokens[mint]
-
         if active_tokens:
             await asyncio.gather(
                 *[update_message(bot, session, m) for m in list(active_tokens)],
@@ -520,12 +570,13 @@ async def debug_loop(bot, session):
         await asyncio.sleep(300)
         try:
             await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
+                chat_id=GROUP_ID,
+                message_thread_id=int(TOPIC_ALL) if TOPIC_ALL else None,
                 text=(
                     f"🔧 DEBUG\n"
                     f"Tokens alerted: {len(alerted_mints)}\n"
-                    f"Live updates: {len(active_tokens)}\n"
-                    f"SOL price: ${SOL_PRICE_USD:.2f}"
+                    f"Live updates:   {len(active_tokens)}\n"
+                    f"SOL price:      ${SOL_PRICE_USD:.2f}"
                 ),
             )
         except Exception as e:
@@ -538,14 +589,19 @@ async def debug_loop(bot, session):
 
 async def main():
     log.info("AnonCoin Launch Monitor starting...")
-    log.info(f"Chat ID: {TELEGRAM_CHAT_ID}")
+    log.info(f"GROUP_ID:   {GROUP_ID}")
+    log.info(f"TOPIC_ALL:  {TOPIC_ALL}")
+    log.info(f"TOPIC_50K:  {TOPIC_50K}")
+    log.info(f"TOPIC_100K: {TOPIC_100K}")
+    log.info(f"TOPIC_500K: {TOPIC_500K}")
+    log.info(f"TOPIC_1M:   {TOPIC_1M}")
+    log.info(f"TOPIC_10M:  {TOPIC_10M}")
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
     async with aiohttp.ClientSession() as session:
         await update_sol_price(session)
 
-        # Verify bot token
         try:
             me = await bot.get_me()
             log.info(f"Bot: @{me.username}")
@@ -553,36 +609,39 @@ async def main():
             log.error(f"Bot token error: {e}")
             return
 
-        # Startup message
         try:
             await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
+                chat_id=GROUP_ID,
+                message_thread_id=int(TOPIC_ALL) if TOPIC_ALL else None,
                 text=(
                     "🟢 AnonCoin Launch Monitor is live!\n\n"
-                    "Watching: anoncoin.it bonding curve\n"
-                    "Alerts on every new token launch\n"
-                    "Live updates every 30s for 1 hour\n\n"
+                    "Watching: anoncoin.it new launches\n"
+                    "Routing alerts by dev follower tier:\n"
+                    "  TOPIC_ALL  → every launch\n"
+                    "  TOPIC_50K  → 50k+ devs\n"
+                    "  TOPIC_100K → 100k+ devs\n"
+                    "  TOPIC_500K → 500k+ devs\n"
+                    "  TOPIC_1M   → 1M+ devs\n"
+                    "  TOPIC_10M  → 10M+ devs\n\n"
                     f"SOL: ${SOL_PRICE_USD:.2f}"
                 ),
             )
         except TelegramError as e:
-            log.error(f"Startup message failed: {e} — check TELEGRAM_CHAT_ID")
+            log.error(f"Startup message failed: {e}")
 
-        # Pre-populate alerted_mints with current tokens so we don't
-        # spam alerts for tokens that already exist on startup
-        log.info("Loading existing tokens to avoid duplicate alerts on startup...")
-        existing_docs = await get_anoncoin_feeds(session)
-        for doc in existing_docs:
+        # Pre-load to avoid startup spam
+        log.info("Pre-loading existing tokens...")
+        existing = await get_feeds(session)
+        for doc in existing:
             mint = (doc.get("token") or {}).get("address", "")
             if mint:
                 alerted_mints.add(mint)
-        log.info(f"Pre-loaded {len(alerted_mints)} existing mints — will only alert on NEW tokens from now on")
+        log.info(f"Pre-loaded {len(alerted_mints)} mints — alerting only NEW tokens from now")
 
         asyncio.create_task(live_update_loop(bot, session))
         if DEBUG_MODE:
             asyncio.create_task(debug_loop(bot, session))
 
-        # Main scan loop
         while True:
             try:
                 await scan_and_alert(bot, session)
