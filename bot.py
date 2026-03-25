@@ -23,6 +23,7 @@ TOPIC_250K = os.getenv("TOPIC_250K")
 TOPIC_500K = os.getenv("TOPIC_500K")
 TOPIC_1M   = os.getenv("TOPIC_1M")
 TOPIC_10M  = os.getenv("TOPIC_10M")
+TOPIC_BOND = os.getenv("TOPIC_BOND")
 
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
@@ -31,6 +32,7 @@ UPDATE_INTERVAL = 30
 UPDATE_DURATION = 3600
 
 alerted_mints: set[str] = set()
+bond_alerted:  set[str] = set()
 active_tokens: dict[str, dict] = {}
 
 FEED_ENDPOINTS = [
@@ -53,19 +55,19 @@ BROWSER_HEADERS = {
 }
 
 FOLLOWER_TIERS = {
-    "0-1k":   "⚪ 0-1k",
-    "1k+":    "🟢 1k+",
-    "5k+":    "🌱 5k+",
-    "10k+":   "🚀 10k+",
-    "25k+":   "💫 25k+",
-    "50k+":   "🔵 50k+",
-    "100k+":  "🟣 100k+",
-    "250k+":  "👑 250k+",
-    "500k+":  "🟠 500k+",
-    "1m+":    "💎 1M+",
-    "5m+":    "🔥 5M+",
-    "10m+":   "🔱 10M+",
-    "15m+":   "🔱 15M+",
+    "0-1k":  "⚪ 0-1k",
+    "1k+":   "🟢 1k+",
+    "5k+":   "🌱 5k+",
+    "10k+":  "🚀 10k+",
+    "25k+":  "💫 25k+",
+    "50k+":  "🔵 50k+",
+    "100k+": "🟣 100k+",
+    "250k+": "👑 250k+",
+    "500k+": "🟠 500k+",
+    "1m+":   "💎 1M+",
+    "5m+":   "🔥 5M+",
+    "10m+":  "🔱 10M+",
+    "15m+":  "🔱 15M+",
 }
 
 SOL_PRICE_USD = 140.0
@@ -488,6 +490,48 @@ async def update_message(bot, session, mint):
                 log.warning(f"Edit failed topic={topic_id} mint={mint[:8]}: {e}")
         await asyncio.sleep(0.2)
 
+async def check_bond_alert(bot, session, mint, doc):
+    if mint in bond_alerted or not TOPIC_BOND:
+        return
+    dex_pair = await get_dexscreener_token(session, mint)
+    mc_raw = None
+    if dex_pair:
+        mc_raw = dex_pair.get("marketCap") or dex_pair.get("fdv")
+    else:
+        mc_str = (doc.get("token") or {}).get("marketCap") or ""
+        try:
+            mc_raw = float(str(mc_str).replace("$", "").replace(",", ""))
+        except Exception:
+            pass
+    if not mc_raw:
+        return
+    try:
+        mc = float(mc_raw)
+    except Exception:
+        return
+    if mc >= 20000:
+        bond_alerted.add(mint)
+        token    = doc.get("token") or {}
+        name     = token.get("name", "Unknown")
+        symbol   = token.get("symbol", "???")
+        agg      = token.get("aggregators") or {}
+        dex_url  = agg.get("dexscreener") or f"https://dexscreener.com/solana/{mint}"
+        grad_pct = token.get("graduationPercentage", "?")
+        text = (
+            f"🎓 *About to Bond!*\n"
+            f"{SEP}\n"
+            f"🪙 *{name}* ${symbol}\n"
+            f"💰 *Market Cap:* {fmt_usd(mc)}\n"
+            f"🎓 *Graduation:* {grad_pct}%\n"
+            f"📋 *Contract:*\n`{mint}`\n"
+            f"{SEP}\n"
+            f"📊 [DexScreener]({dex_url})"
+        )
+        buttons = build_buttons(doc)
+        logo    = await get_token_logo(session, doc)
+        await send_to_topic(bot, int(TOPIC_BOND), text, buttons, logo)
+        log.info(f"BOND ALERT: {symbol} mc=${mc:.0f}")
+
 
 async def scan_and_alert(bot, session):
     docs = await get_feeds(session)
@@ -526,6 +570,10 @@ async def live_update_loop(bot, session):
                 *[update_message(bot, session, m) for m in list(active_tokens)],
                 return_exceptions=True,
             )
+            await asyncio.gather(
+                *[check_bond_alert(bot, session, m, active_tokens[m]["doc"]) for m in list(active_tokens)],
+                return_exceptions=True,
+            )
 
 async def debug_loop(bot, session):
     while True:
@@ -558,6 +606,7 @@ async def main():
     log.info(f"TOPIC_500K: {TOPIC_500K}")
     log.info(f"TOPIC_1M:   {TOPIC_1M}")
     log.info(f"TOPIC_10M:  {TOPIC_10M}")
+    log.info(f"TOPIC_BOND: {TOPIC_BOND}")
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
@@ -587,7 +636,8 @@ async def main():
                     "  TOPIC_250K → 👑 250k+ devs\n"
                     "  TOPIC_500K → 🟠 500k+ devs\n"
                     "  TOPIC_1M   → 💎 1M+ devs\n"
-                    "  TOPIC_10M  → 🔱 10M+ devs\n\n"
+                    "  TOPIC_10M  → 🔱 10M+ devs\n"
+                    "  TOPIC_BOND → 🎓 About to Bond\n\n"
                     f"SOL: ${SOL_PRICE_USD:.2f}"
                 ),
             )
