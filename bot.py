@@ -11,16 +11,18 @@ from telegram.error import TelegramError
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
-# Supergroup chat ID (negative number)
 GROUP_ID   = int(os.getenv("GROUP_ID", "0"))
 
-# Topic (message_thread_id) per follower tier — falls back to TOPIC_ALL if not set
-TOPIC_ALL  = os.getenv("TOPIC_ALL")   # every alert goes here regardless
-TOPIC_50K  = os.getenv("TOPIC_50K")   # 50k+
-TOPIC_100K = os.getenv("TOPIC_100K")  # 100k+
-TOPIC_500K = os.getenv("TOPIC_500K")  # 500k+
-TOPIC_1M   = os.getenv("TOPIC_1M")    # 1M+
-TOPIC_10M  = os.getenv("TOPIC_10M")   # 10M+
+TOPIC_ALL  = os.getenv("TOPIC_ALL")
+TOPIC_5K   = os.getenv("TOPIC_5K")
+TOPIC_10K  = os.getenv("TOPIC_10K")
+TOPIC_25K  = os.getenv("TOPIC_25K")
+TOPIC_50K  = os.getenv("TOPIC_50K")
+TOPIC_100K = os.getenv("TOPIC_100K")
+TOPIC_250K = os.getenv("TOPIC_250K")
+TOPIC_500K = os.getenv("TOPIC_500K")
+TOPIC_1M   = os.getenv("TOPIC_1M")
+TOPIC_10M  = os.getenv("TOPIC_10M")
 
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
@@ -50,20 +52,20 @@ BROWSER_HEADERS = {
     "Referer": "https://anoncoin.it/board",
 }
 
-# Follower tier display strings (matches anoncoin.it exactly)
 FOLLOWER_TIERS = {
     "0-1k":   "⚪ 0-1k",
     "1k+":    "🟢 1k+",
-    "10k+":   "🟢 10k+",
-    "25k+":   "🔵 25k+",
+    "5k+":    "🌱 5k+",
+    "10k+":   "🚀 10k+",
+    "25k+":   "💫 25k+",
     "50k+":   "🔵 50k+",
     "100k+":  "🟣 100k+",
-    "250k+":  "🟣 250k+",
+    "250k+":  "👑 250k+",
     "500k+":  "🟠 500k+",
-    "1m+":    "🔴 1M+",
-    "5m+":    "🔴 5M+",
-    "10m+":   "🔴 10M+",
-    "15m+":   "🔴 15M+",
+    "1m+":    "💎 1M+",
+    "5m+":    "🔥 5M+",
+    "10m+":   "🔱 10M+",
+    "15m+":   "🔱 15M+",
 }
 
 SOL_PRICE_USD = 140.0
@@ -74,40 +76,36 @@ log = logging.getLogger(__name__)
 SEP = "――――――――――――――――――――――"
 
 
-# ═══════════════════════════════════════════════════════════════════
-# TOPIC ROUTING
-# ═══════════════════════════════════════════════════════════════════
-
-def get_topics_for_tier(followers_formatted: str) -> list[int | None]:
-    """
-    Returns a list of topic IDs to send the alert to.
-    TOPIC_ALL always receives every alert.
-    Higher tier topics receive alerts for their tier and above.
-
-    Tier hierarchy:
-      0-1k / 1k+ / 10k+ / 25k+  → TOPIC_ALL only
-      50k+  / 250k+              → TOPIC_ALL + TOPIC_50K
-      100k+                      → TOPIC_ALL + TOPIC_50K + TOPIC_100K
-      500k+                      → TOPIC_ALL + TOPIC_50K + TOPIC_100K + TOPIC_500K
-      1M+  / 5M+                 → TOPIC_ALL + TOPIC_50K + TOPIC_100K + TOPIC_500K + TOPIC_1M
-      10M+ / 15M+                → all topics
-    """
+def get_topics_for_tier(followers_formatted: str) -> list:
     key = (followers_formatted or "").lower().strip()
-
-    # Build the list of topics to post to
     topics = []
 
-    # Always add TOPIC_ALL
     if TOPIC_ALL:
         topics.append(int(TOPIC_ALL))
 
-    if key in ("50k+", "250k+", "100k+", "500k+", "1m+", "5m+", "10m+", "15m+"):
+    if key in ("5k+", "10k+", "25k+", "50k+", "100k+", "250k+", "500k+", "1m+", "5m+", "10m+", "15m+"):
+        if TOPIC_5K:
+            topics.append(int(TOPIC_5K))
+
+    if key in ("10k+", "25k+", "50k+", "100k+", "250k+", "500k+", "1m+", "5m+", "10m+", "15m+"):
+        if TOPIC_10K:
+            topics.append(int(TOPIC_10K))
+
+    if key in ("25k+", "50k+", "100k+", "250k+", "500k+", "1m+", "5m+", "10m+", "15m+"):
+        if TOPIC_25K:
+            topics.append(int(TOPIC_25K))
+
+    if key in ("50k+", "100k+", "250k+", "500k+", "1m+", "5m+", "10m+", "15m+"):
         if TOPIC_50K:
             topics.append(int(TOPIC_50K))
 
-    if key in ("100k+", "500k+", "1m+", "5m+", "10m+", "15m+"):
+    if key in ("100k+", "250k+", "500k+", "1m+", "5m+", "10m+", "15m+"):
         if TOPIC_100K:
             topics.append(int(TOPIC_100K))
+
+    if key in ("250k+", "500k+", "1m+", "5m+", "10m+", "15m+"):
+        if TOPIC_250K:
+            topics.append(int(TOPIC_250K))
 
     if key in ("500k+", "1m+", "5m+", "10m+", "15m+"):
         if TOPIC_500K:
@@ -121,7 +119,6 @@ def get_topics_for_tier(followers_formatted: str) -> list[int | None]:
         if TOPIC_10M:
             topics.append(int(TOPIC_10M))
 
-    # Deduplicate while preserving order
     seen = set()
     unique = []
     for t in topics:
@@ -129,13 +126,8 @@ def get_topics_for_tier(followers_formatted: str) -> list[int | None]:
             seen.add(t)
             unique.append(t)
 
-    # If no topics configured at all, fall back to no thread (plain group message)
     return unique if unique else [None]
 
-
-# ═══════════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════════
 
 def fmt_usd(n):
     try:
@@ -195,10 +187,6 @@ def elapsed_str(seconds):
     h, m = seconds // 3600, (seconds % 3600) // 60
     return f"{h}h {m}m ago"
 
-
-# ═══════════════════════════════════════════════════════════════════
-# API
-# ═══════════════════════════════════════════════════════════════════
 
 async def fetch_json(session, url, headers=None):
     try:
@@ -262,10 +250,6 @@ async def get_dexscreener_token(session, mint):
     return max(sol_pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0))
 
 
-# ═══════════════════════════════════════════════════════════════════
-# MESSAGE BUILDER
-# ═══════════════════════════════════════════════════════════════════
-
 def build_message(doc, dex_pair=None):
     token = doc.get("token", {}) or {}
     user  = doc.get("userId", {}) or {}
@@ -276,7 +260,6 @@ def build_message(doc, dex_pair=None):
     symbol = token.get("symbol", "???")
     mint   = token.get("address", "")
 
-    # Market data
     if dex_pair:
         mc_raw  = dex_pair.get("marketCap") or dex_pair.get("fdv")
         mc      = fmt_usd(mc_raw) if mc_raw else fmt_usd(token.get("marketCap"))
@@ -294,13 +277,11 @@ def build_message(doc, dex_pair=None):
     holders  = fmt_num(token.get("holders", 0))
     grad_pct = token.get("graduationPercentage", 0)
 
-    # Dev info
     dev_name      = user.get("name") or user.get("userName", "Unknown")
     tw_obj        = user.get("twitter", {}) or {}
     followers_fmt = tw_obj.get("followersFormatted", "")
     followers     = follower_tier_display(followers_fmt)
 
-    # Followed by
     tagged = meta.get("tagUserProfiles") or []
     if tagged:
         parts = []
@@ -327,11 +308,9 @@ def build_message(doc, dex_pair=None):
     else:
         followed_by = "Not followed by anyone"
 
-    # Twitter trend
     x_views    = trend.get("xViews", 0)
     top_voices = trend.get("topVoices") or []
 
-    # Launch time
     launched_ts  = parse_iso(doc.get("addedOn", ""))
     launched_str = elapsed_str(time.time() - launched_ts) if launched_ts else "—"
 
@@ -400,10 +379,6 @@ def build_buttons(doc):
     return InlineKeyboardMarkup(rows)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# LOGO
-# ═══════════════════════════════════════════════════════════════════
-
 async def get_token_logo(session, doc):
     token = doc.get("token", {}) or {}
     mint  = token.get("address", "")
@@ -430,12 +405,7 @@ async def get_token_logo(session, doc):
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════
-# SEND & UPDATE
-# ═══════════════════════════════════════════════════════════════════
-
 async def send_to_topic(bot, topic_id, text, buttons, logo):
-    """Send a message to a specific topic thread."""
     kwargs = dict(
         chat_id=GROUP_ID,
         parse_mode=ParseMode.MARKDOWN,
@@ -443,7 +413,6 @@ async def send_to_topic(bot, topic_id, text, buttons, logo):
     )
     if topic_id is not None:
         kwargs["message_thread_id"] = topic_id
-
     try:
         if logo:
             msg = await bot.send_photo(photo=logo, caption=text, **kwargs)
@@ -466,7 +435,6 @@ async def send_alert(bot, session, doc):
     buttons  = build_buttons(doc)
     logo     = await get_token_logo(session, doc)
 
-    # Get all topics this follower tier should be posted to
     topics = get_topics_for_tier(followers_fmt)
 
     sent_messages = {}
@@ -477,11 +445,11 @@ async def send_alert(bot, session, doc):
                 "message_id": msg.message_id,
                 "has_photo":  logo is not None,
             }
-        await asyncio.sleep(0.3)  # small gap between topic posts
+        await asyncio.sleep(0.3)
 
     if sent_messages:
         active_tokens[mint] = {
-            "messages":      sent_messages,   # topic_id -> {message_id, has_photo}
+            "messages":      sent_messages,
             "alert_sent_at": time.time(),
             "doc":           doc,
         }
@@ -492,12 +460,10 @@ async def update_message(bot, session, mint):
     info = active_tokens.get(mint)
     if not info:
         return
-
     doc      = info["doc"]
     dex_pair = await get_dexscreener_token(session, mint)
     text     = build_message(doc, dex_pair)
     buttons  = build_buttons(doc)
-
     for topic_id, msg_info in info["messages"].items():
         try:
             if msg_info["has_photo"]:
@@ -522,10 +488,6 @@ async def update_message(bot, session, mint):
                 log.warning(f"Edit failed topic={topic_id} mint={mint[:8]}: {e}")
         await asyncio.sleep(0.2)
 
-
-# ═══════════════════════════════════════════════════════════════════
-# SCAN LOOP
-# ═══════════════════════════════════════════════════════════════════
 
 async def scan_and_alert(bot, session):
     docs = await get_feeds(session)
@@ -583,16 +545,16 @@ async def debug_loop(bot, session):
             log.error(f"Debug report failed: {e}")
 
 
-# ═══════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════
-
 async def main():
     log.info("AnonCoin Launch Monitor starting...")
     log.info(f"GROUP_ID:   {GROUP_ID}")
     log.info(f"TOPIC_ALL:  {TOPIC_ALL}")
+    log.info(f"TOPIC_5K:   {TOPIC_5K}")
+    log.info(f"TOPIC_10K:  {TOPIC_10K}")
+    log.info(f"TOPIC_25K:  {TOPIC_25K}")
     log.info(f"TOPIC_50K:  {TOPIC_50K}")
     log.info(f"TOPIC_100K: {TOPIC_100K}")
+    log.info(f"TOPIC_250K: {TOPIC_250K}")
     log.info(f"TOPIC_500K: {TOPIC_500K}")
     log.info(f"TOPIC_1M:   {TOPIC_1M}")
     log.info(f"TOPIC_10M:  {TOPIC_10M}")
@@ -615,21 +577,23 @@ async def main():
                 message_thread_id=int(TOPIC_ALL) if TOPIC_ALL else None,
                 text=(
                     "🟢 AnonCoin Launch Monitor is live!\n\n"
-                    "Watching: anoncoin.it new launches\n"
                     "Routing alerts by dev follower tier:\n"
                     "  TOPIC_ALL  → every launch\n"
-                    "  TOPIC_50K  → 50k+ devs\n"
-                    "  TOPIC_100K → 100k+ devs\n"
-                    "  TOPIC_500K → 500k+ devs\n"
-                    "  TOPIC_1M   → 1M+ devs\n"
-                    "  TOPIC_10M  → 10M+ devs\n\n"
+                    "  TOPIC_5K   → 🌱 5k+ devs\n"
+                    "  TOPIC_10K  → 🚀 10k+ devs\n"
+                    "  TOPIC_25K  → 💫 25k+ devs\n"
+                    "  TOPIC_50K  → 🔵 50k+ devs\n"
+                    "  TOPIC_100K → 🟣 100k+ devs\n"
+                    "  TOPIC_250K → 👑 250k+ devs\n"
+                    "  TOPIC_500K → 🟠 500k+ devs\n"
+                    "  TOPIC_1M   → 💎 1M+ devs\n"
+                    "  TOPIC_10M  → 🔱 10M+ devs\n\n"
                     f"SOL: ${SOL_PRICE_USD:.2f}"
                 ),
             )
         except TelegramError as e:
             log.error(f"Startup message failed: {e}")
 
-        # Pre-load to avoid startup spam
         log.info("Pre-loading existing tokens...")
         existing = await get_feeds(session)
         for doc in existing:
